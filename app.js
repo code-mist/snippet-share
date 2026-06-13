@@ -100,7 +100,7 @@
     $(id).hidden = true;
   }
 
-  // ---------- 列表加载 ----------
+  // ---------- 列表加载（用 GitHub API，绕过 jsdelivr 缓存） ----------
   async function fetchSnippets(silent = false) {
     if (!config.repo) {
       $('snippetList').innerHTML =
@@ -112,15 +112,18 @@
       $('snippetList').innerHTML = '<div class="empty">加载中...</div>';
     }
     try {
-      const url = `${config.cdn}/${config.repo}@${config.branch}/index.json?_ts=${Date.now()}`;
-      const res = await fetch(url, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      snippets = Array.isArray(data) ? data : (data.snippets || []);
+      // GitHub API 始终是最新数据，不会被 CDN 缓存影响
+      const data = await getFile('index.json');
+      if (!data || !data.content) {
+        snippets = [];
+      } else {
+        const parsed = JSON.parse(base64ToUtf8(data.content));
+        snippets = Array.isArray(parsed) ? parsed : (parsed.snippets || []);
+      }
       renderSnippetList();
     } catch (err) {
       $('snippetList').innerHTML =
-        `<div class="empty error">加载失败：${escapeHtml(err.message)}<br><small>提示：国内可尝试切换 CDN 域名（设置中）<br>或确认仓库存在 <code>index.json</code></small></div>`;
+        `<div class="empty error">加载失败：${escapeHtml(err.message)}<br><small>提示：检查网络或 GitHub Token 权限</small></div>`;
     }
   }
 
@@ -162,10 +165,8 @@
     $('content').innerHTML = '<div class="empty">加载中...</div>';
     try {
       const ext = getFileExt(snippet.lang);
-      const url = `${config.cdn}/${config.repo}@${config.branch}/snippets/${encodeURIComponent(id)}.${ext}?_ts=${Date.now()}`;
-      const res = await fetch(url, { cache: 'no-store' });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const code = await res.text();
+      const filePath = `snippets/${encodeURIComponent(id)}.${ext}`;
+      const code = await loadFileContent(filePath);
       currentSnippet = { ...snippet, code, _isShared: false };
       renderSnippetDetail();
       renderSnippetList($('searchInput').value);
@@ -173,6 +174,21 @@
       $('content').innerHTML =
         `<div class="empty error">加载片段失败：${escapeHtml(err.message)}</div>`;
     }
+  }
+
+  // 加载文件：jsdelivr 优先，失败回退到 GitHub API
+  async function loadFileContent(filePath) {
+    // 1. 尝试 jsdelivr CDN
+    try {
+      const cdnUrl = `${config.cdn}/${config.repo}@${config.branch}/${filePath}?_ts=${Date.now()}`;
+      const res = await fetch(cdnUrl, { cache: 'no-store' });
+      if (res.ok) return await res.text();
+    } catch (e) { /* 继续尝试 GitHub API */ }
+
+    // 2. 回退到 GitHub API（始终最新）
+    const data = await getFile(filePath);
+    if (!data) throw new Error('文件不存在');
+    return base64ToUtf8(data.content);
   }
 
   // ---------- 渲染详情 ----------
@@ -336,11 +352,13 @@
     const date = new Date().toISOString();
 
     try {
-      // 1. 读取现有 index.json
+      // 1. 读取最新 index.json（GitHub API，绕过 CDN 缓存）
       let indexData = [];
+      let indexSha = null;
       try {
         const existing = await getFile('index.json');
         if (existing && existing.content) {
+          indexSha = existing.sha;
           const parsed = JSON.parse(base64ToUtf8(existing.content));
           indexData = Array.isArray(parsed) ? parsed : (parsed.snippets || []);
         }
@@ -348,26 +366,57 @@
         // index.json 不存在，初始化空数组
       }
 
+      const newEntry = { id, title, lang, desc, date };
+      indexData.unshift(newEntry);
+
       // 2. 上传代码文件
       await githubPut(filePath, code, `Add snippet: ${title}`);
 
-      // 3. 更新 index.json
-      const newEntry = { id, title, lang, desc, date };
-      indexData.unshift(newEntry);
-      await githubPut('index.json', JSON.stringify({ snippets: indexData }, null, 2), 'Update snippets index');
+      // 3. 更新 index.json（带 sha 避免覆盖并发更新）
+      await githubPutWithSha('index.json', JSON.stringify({ snippets: indexData }, null, 2),
+        'Update snippets index', indexSha);
 
-      showToast('保存成功！CDN 缓存约 1-3 分钟生效', 'success', 3500);
+      // 4. 立即更新本地状态（用户立刻看到新片段，无需等待）
+      snippets = indexData;
+      currentSnippet = { ...newEntry, code, _isShared: false };
+      renderSnippetList($('searchInput').value);
+      renderSnippetDetail();
       hideModal('newModal');
       clearNewForm();
-
-      // 等待 CDN 同步后刷新
-      setTimeout(() => fetchSnippets(), 2000);
+      showToast('保存成功！', 'success');
     } catch (err) {
       errorEl.textContent = '保存失败：' + err.message;
     } finally {
       saveBtn.disabled = false;
       saveBtn.textContent = '保存到 GitHub';
     }
+  }
+
+  // githubPut 的变体：调用方已知 sha（避免二次查询）
+  async function githubPutWithSha(path, content, message, sha) {
+    const url = `https://api.github.com/repos/${config.repo}/contents/${path}`;
+    const body = {
+      message,
+      content: utf8ToBase64(content),
+      branch: config.branch
+    };
+    if (sha) body.sha = sha;
+
+    const res = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `token ${config.token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github.v3+json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || `HTTP ${res.status}`);
+    }
+    return res.json();
   }
 
   function clearNewForm() {
