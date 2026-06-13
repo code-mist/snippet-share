@@ -300,6 +300,17 @@ button {
   background: #0077ed;
 }
 
+.btn-danger {
+  background: #fff;
+  color: #d70015;
+  border-color: #ffcdd2;
+}
+
+.btn-danger:hover {
+  background: #fff5f5;
+  border-color: #d70015;
+}
+
 .icon-btn {
   padding: 6px 10px;
   font-size: 16px;

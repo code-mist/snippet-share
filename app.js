@@ -21,6 +21,7 @@
   // ---------- 状态 ----------
   let snippets = [];
   let currentSnippet = null;
+  let editingId = null; // null=新建模式，string=编辑模式
   let sharedData = null; // URL hash 中内嵌的分享数据
 
   // ---------- DOM ----------
@@ -195,6 +196,7 @@
   function renderSnippetDetail() {
     const s = currentSnippet;
     const lang = s.lang || 'plaintext';
+    const canEdit = !s._isShared; // URL 分享的片段不能编辑/删除
     $('content').innerHTML = `
       <div class="detail-header">
         <div>
@@ -210,6 +212,10 @@
           <button class="btn" id="copyBtn">📋 复制</button>
           <button class="btn" id="rawBtn">↗ 原始</button>
           <button class="btn" id="shareBtn">🔗 分享</button>
+          ${canEdit ? `
+            <button class="btn" id="editBtn">✏️ 编辑</button>
+            <button class="btn btn-danger" id="deleteBtn">🗑️ 删除</button>
+          ` : ''}
         </div>
       </div>
       <pre class="language-${escapeHtml(lang)}"><code class="language-${escapeHtml(lang)}">${escapeHtml(s.code)}</code></pre>
@@ -228,6 +234,11 @@
       }
     });
     $('shareBtn').addEventListener('click', () => generateShareLink(s));
+
+    if (canEdit) {
+      $('editBtn').addEventListener('click', () => openNewModal(s));
+      $('deleteBtn').addEventListener('click', () => confirmDelete(s));
+    }
 
     if (window.Prism) {
       try { Prism.highlightAllUnder($('content')); } catch (e) { /* ignore */ }
@@ -343,13 +354,13 @@
     if (!config.token) { errorEl.textContent = '请先在设置中配置 Personal Access Token'; return; }
 
     const saveBtn = $('saveSnippet');
+    const isEdit = !!editingId;
     saveBtn.disabled = true;
-    saveBtn.textContent = '保存中...';
+    saveBtn.textContent = isEdit ? '更新中...' : '保存中...';
 
-    const id = genId();
+    const id = isEdit ? editingId : genId();
     const ext = getFileExt(lang);
     const filePath = `snippets/${id}.${ext}`;
-    const date = new Date().toISOString();
 
     try {
       // 1. 读取最新 index.json（GitHub API，绕过 CDN 缓存）
@@ -366,29 +377,45 @@
         // index.json 不存在，初始化空数组
       }
 
-      const newEntry = { id, title, lang, desc, date };
-      indexData.unshift(newEntry);
+      // 2. 构造条目并更新 indexData
+      let entry;
+      if (isEdit) {
+        const idx = indexData.findIndex((s) => s.id === id);
+        if (idx >= 0) {
+          // 保留原 date
+          entry = { ...indexData[idx], title, lang, desc };
+          indexData[idx] = entry;
+        } else {
+          // 外部已删除，作为新建处理
+          entry = { id, title, lang, desc, date: new Date().toISOString() };
+          indexData.unshift(entry);
+        }
+      } else {
+        entry = { id, title, lang, desc, date: new Date().toISOString() };
+        indexData.unshift(entry);
+      }
 
-      // 2. 上传代码文件
-      await githubPut(filePath, code, `Add snippet: ${title}`);
+      // 3. 上传/更新代码文件
+      await githubPut(filePath, code, isEdit ? `Update snippet: ${title}` : `Add snippet: ${title}`);
 
-      // 3. 更新 index.json（带 sha 避免覆盖并发更新）
+      // 4. 更新 index.json（带 sha 避免覆盖并发更新）
       await githubPutWithSha('index.json', JSON.stringify({ snippets: indexData }, null, 2),
-        'Update snippets index', indexSha);
+        isEdit ? 'Update snippets index' : 'Add to snippets index', indexSha);
 
-      // 4. 立即更新本地状态（用户立刻看到新片段，无需等待）
+      // 5. 立即更新本地状态（用户立刻看到，无需等待 CDN）
       snippets = indexData;
-      currentSnippet = { ...newEntry, code, _isShared: false };
+      currentSnippet = { ...entry, code, _isShared: false };
       renderSnippetList($('searchInput').value);
       renderSnippetDetail();
       hideModal('newModal');
       clearNewForm();
-      showToast('保存成功！', 'success');
+      editingId = null;
+      showToast(isEdit ? '更新成功！' : '保存成功！', 'success');
     } catch (err) {
       errorEl.textContent = '保存失败：' + err.message;
     } finally {
       saveBtn.disabled = false;
-      saveBtn.textContent = '保存到 GitHub';
+      saveBtn.textContent = isEdit ? '更新' : '保存到 GitHub';
     }
   }
 
@@ -423,6 +450,82 @@
     $('snippetTitle').value = '';
     $('snippetDesc').value = '';
     $('snippetCode').value = '';
+  }
+
+  // ---------- 删除 ----------
+  function confirmDelete(snippet) {
+    if (!confirm(`确定要删除片段"${snippet.title || '未命名'}"吗？\n此操作无法撤销。`)) return;
+    deleteSnippet(snippet);
+  }
+
+  async function deleteSnippet(snippet) {
+    try {
+      showToast('删除中...', 'info', 10000);
+
+      // 1. 读取最新 index.json
+      const indexFile = await getFile('index.json');
+      if (!indexFile) throw new Error('index.json 不存在');
+
+      let indexData;
+      try {
+        const parsed = JSON.parse(base64ToUtf8(indexFile.content));
+        indexData = Array.isArray(parsed) ? parsed : (parsed.snippets || []);
+      } catch (e) {
+        throw new Error('index.json 解析失败');
+      }
+
+      const newIndex = indexData.filter((s) => s.id !== snippet.id);
+      if (newIndex.length === indexData.length) {
+        throw new Error('片段在 index.json 中未找到，可能已被外部删除');
+      }
+
+      // 2. 删除代码文件
+      const ext = getFileExt(snippet.lang);
+      const filePath = `snippets/${snippet.id}.${ext}`;
+      const codeFile = await getFile(filePath);
+      if (codeFile) {
+        await githubDelete(filePath, codeFile.sha, `Delete snippet: ${snippet.title}`);
+      }
+
+      // 3. 更新 index.json
+      const payload = newIndex.length > 0
+        ? JSON.stringify({ snippets: newIndex }, null, 2)
+        : JSON.stringify({ snippets: [] }, null, 2);
+      await githubPutWithSha('index.json', payload, 'Update snippets index', indexFile.sha);
+
+      // 4. 更新本地状态
+      snippets = newIndex;
+      currentSnippet = null;
+      renderSnippetList($('searchInput').value);
+      $('content').innerHTML = `
+        <div class="welcome">
+          <h2>片段已删除</h2>
+          <p>从左侧选择其他片段，或点击"新建"创建新片段。</p>
+        </div>`;
+      showToast('删除成功', 'success');
+    } catch (err) {
+      showToast('删除失败：' + err.message, 'error', 4000);
+    }
+  }
+
+  async function githubDelete(path, sha, message) {
+    const url = `https://api.github.com/repos/${config.repo}/contents/${path}`;
+    const res = await fetch(url, {
+      method: 'DELETE',
+      headers: {
+        'Authorization': `token ${config.token}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github.v3+json'
+      },
+      body: JSON.stringify({ message, sha, branch: config.branch })
+    });
+
+    if (res.status === 404) return; // 文件本就不存在，视为成功
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || `HTTP ${res.status}`);
+    }
+    return res.json();
   }
 
   // ---------- GitHub API ----------
@@ -500,8 +603,8 @@
     fetchSnippets();
   }
 
-  // ---------- 新建 ----------
-  function openNewModal() {
+  // ---------- 新建 / 编辑 ----------
+  function openNewModal(snippet = null) {
     if (!config.repo) {
       showToast('请先在设置中配置 GitHub 仓库', 'error');
       openSettings();
@@ -510,10 +613,29 @@
     if (!config.token) {
       showToast('未配置 PAT。可改用"生成分享链接"', 'error', 3500);
     }
-    clearNewForm();
+
+    editingId = snippet ? snippet.id : null;
+
+    if (snippet) {
+      fillNewForm(snippet);
+      $('newModalTitle').textContent = '编辑片段';
+      $('saveSnippet').textContent = '更新';
+    } else {
+      clearNewForm();
+      $('newModalTitle').textContent = '新建片段';
+      $('saveSnippet').textContent = '保存到 GitHub';
+    }
+
     $('newError').textContent = '';
     showModal('newModal');
     setTimeout(() => $('snippetTitle').focus(), 100);
+  }
+
+  function fillNewForm(s) {
+    $('snippetTitle').value = s.title || '';
+    $('snippetLang').value = s.lang || 'plaintext';
+    $('snippetDesc').value = s.desc || '';
+    $('snippetCode').value = s.code || '';
   }
 
   function handleShareLink() {
